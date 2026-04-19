@@ -5,9 +5,9 @@ import google.generativeai as genai
 from datetime import datetime
 import plotly.express as px
 import json
+import re  # <--- Ini yang tadi kurang dan menyebabkan NameError
 
 # --- CONFIG & SECRETS ---
-# Pastikan di Streamlit Cloud 'Secrets' sudah ada GOOGLE_API_KEY
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
     genai.configure(api_key=GOOGLE_API_KEY)
@@ -26,45 +26,57 @@ def init_db():
 
 conn = init_db()
 
-# --- AI LOGIC (ANTI-404 AUTO DISCOVERY) ---
+# --- AI LOGIC DENGAN CADANGAN OFFLINE ---
 def process_with_ai(text):
-    # --- STEP 1: LOGIKA OFFLINE (CADANGAN) ---
+    # Logika Offline (Cadangan jika AI kena Limit)
     def fallback_parse(t):
         t = t.lower()
+        # Mencari angka untuk nominal
         nums = re.findall(r'\d+', t.replace('.', '').replace(',', ''))
         nom = float(nums[0]) if nums else 0
+        
+        # Tebak kategori sederhana
         kat = "Lainnya"
-        if any(k in t for k in ["makan", "kopi", "bakso", "nasi"]): kat = "Makanan"
-        elif any(k in t for k in ["bensin", "gojek", "parkir"]): kat = "Transportasi"
+        if any(k in t for k in ["makan", "kopi", "bakso", "nasi", "sate", "ayam"]): kat = "Makanan"
+        elif any(k in t for k in ["bensin", "gojek", "grab", "parkir", "ojek"]): kat = "Transportasi"
+        elif any(k in t for k in ["shopee", "tokped", "beli", "baju", "celana"]): kat = "Belanja"
+        elif any(k in t for k in ["listrik", "air", "wifi", "pulsa", "kuota"]): kat = "Tagihan"
+        
+        # Ambil deskripsi dengan membuang angka
         desk = re.sub(r'\d+', '', t).replace('rp', '').strip().title()
         return {"item": desk or "Transaksi", "kategori": kat, "nominal": nom}
 
-    # --- STEP 2: COBA PAKE AI ---
     try:
+        # Mencari model yang tersedia
         available_models = [m.name for m in genai.list_models() 
                            if 'generateContent' in m.supported_generation_methods]
         
-        # Utamakan 1.5 Flash karena kuotanya lebih besar dari 2.0
+        # Prioritas 1.5 Flash karena kuota lebih stabil
         prioritas = ['models/gemini-1.5-flash', 'models/gemini-2.0-flash']
         target = next((p for p in prioritas if p in available_models), available_models[0])
 
         model = genai.GenerativeModel(target)
-        prompt = f"Extract JSON: {text}. Format: {{\"item\":\"str\", \"kategori\":\"str\", \"nominal\":int}}"
+        prompt = f"Extract transaction in JSON: {text}. Format: {{\"item\":\"str\", \"kategori\":\"str\", \"nominal\":int}}"
         
-        # Tambahkan timeout singkat agar tidak nunggu kelamaan
         response = model.generate_content(prompt)
         res_text = response.text.strip()
         
         if "```json" in res_text:
             res_text = res_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in res_text:
+            res_text = res_text.split("```")[1].strip()
+            
         return json.loads(res_text)
 
     except Exception as e:
-        # --- STEP 3: JIKA AI ERROR (429/404), PAKAI LOGIKA OFFLINE ---
-        st.warning("⚠️ Kuota AI Habis. Menggunakan pemrosesan offline...")
+        # Jika AI kena Quota Exceeded (429), jalankan fungsi offline
+        if "429" in str(e) or "quota" in str(e).lower():
+            st.warning("⚠️ Kuota AI habis, menggunakan pemrosesan otomatis (Offline).")
+        else:
+            st.warning(f"⚠️ Masalah koneksi: {e}. Menggunakan mode Offline.")
         return fallback_parse(text)
 
-# --- APP UI ---
+# --- UI STREAMLIT ---
 st.set_page_config(page_title="AI Tracker Cloud", layout="wide")
 st.title("🚀 AI Expense Tracker (Live Version)")
 
@@ -72,36 +84,33 @@ col1, col2 = st.columns([1, 1])
 
 with col1:
     st.subheader("Input Transaksi")
-    user_input = st.text_input("Ketik pengeluaran (Contoh: Beli gula 15000)", placeholder="Apa yang Anda beli hari ini?")
+    user_input = st.text_input("Ketik pengeluaran (Contoh: Bensin 50rb)", placeholder="Apa yang Anda beli?")
     
     if st.button("Simpan"):
         if user_input:
-            with st.spinner("AI sedang memproses..."):
+            with st.spinner("Sedang mencatat..."):
                 data = process_with_ai(user_input)
                 
-                if data:
-                    # Simpan ke Database
+                if data and data['nominal'] > 0:
                     c = conn.cursor()
                     c.execute("INSERT INTO expenses (tanggal, deskripsi, kategori, nominal) VALUES (?,?,?,?)",
                               (datetime.now().strftime("%Y-%m-%d %H:%M"), data['item'], data['kategori'], data['nominal']))
                     conn.commit()
-                    st.success(f"Berhasil mencatat: {data['item']} (Rp {data['nominal']:,})")
+                    st.success(f"Berhasil: {data['item']} (Rp {data['nominal']:,})")
                     st.rerun()
+                else:
+                    st.error("Gagal mendeteksi nominal angka. Coba tulis: 'Beli kopi 15000'")
 
 with col2:
     st.subheader("Visualisasi")
     df = pd.read_sql_query("SELECT * FROM expenses", conn)
     if not df.empty:
-        fig = px.pie(df, values='nominal', names='kategori', hole=0.5, 
-                     title="Proporsi Pengeluaran",
-                     color_discrete_sequence=px.colors.qualitative.Safe)
+        fig = px.pie(df, values='nominal', names='kategori', hole=0.5)
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("Belum ada data untuk ditampilkan.")
+        st.info("Belum ada data.")
 
 st.divider()
 st.subheader("📜 Riwayat Transaksi")
 if not df.empty:
     st.dataframe(df.sort_values(by='id', ascending=False), use_container_width=True)
-else:
-    st.write("Daftar transaksi kosong.")
