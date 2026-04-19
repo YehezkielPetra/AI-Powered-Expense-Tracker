@@ -28,45 +28,41 @@ conn = init_db()
 
 # --- AI LOGIC (ANTI-404 AUTO DISCOVERY) ---
 def process_with_ai(text):
+    # --- STEP 1: LOGIKA OFFLINE (CADANGAN) ---
+    def fallback_parse(t):
+        t = t.lower()
+        nums = re.findall(r'\d+', t.replace('.', '').replace(',', ''))
+        nom = float(nums[0]) if nums else 0
+        kat = "Lainnya"
+        if any(k in t for k in ["makan", "kopi", "bakso", "nasi"]): kat = "Makanan"
+        elif any(k in t for k in ["bensin", "gojek", "parkir"]): kat = "Transportasi"
+        desk = re.sub(r'\d+', '', t).replace('rp', '').strip().title()
+        return {"item": desk or "Transaksi", "kategori": kat, "nominal": nom}
+
+    # --- STEP 2: COBA PAKE AI ---
     try:
-        # Mencari model yang tersedia secara otomatis di akun user
         available_models = [m.name for m in genai.list_models() 
                            if 'generateContent' in m.supported_generation_methods]
         
-        # Urutan prioritas model
-        # Pindahkan 1.5 ke depan karena kuotanya lebih banyak
-        prioritas = ['models/gemini-1.5-flash', 'models/gemini-2.0-flash', 'models/gemini-pro']
-        
-        target_model = None
-        for p in prioritas:
-            if p in available_models:
-                target_model = p
-                break
-        
-        if not target_model:
-            target_model = available_models[0]
+        # Utamakan 1.5 Flash karena kuotanya lebih besar dari 2.0
+        prioritas = ['models/gemini-1.5-flash', 'models/gemini-2.0-flash']
+        target = next((p for p in prioritas if p in available_models), available_models[0])
 
-        model = genai.GenerativeModel(target_model)
+        model = genai.GenerativeModel(target)
+        prompt = f"Extract JSON: {text}. Format: {{\"item\":\"str\", \"kategori\":\"str\", \"nominal\":int}}"
         
-        prompt = f"""
-        Ekstrak data transaksi dari teks ini: "{text}"
-        Wajib balas hanya dengan format JSON murni:
-        {{"item": "nama barang", "kategori": "Makanan/Transportasi/Belanja/Tagihan/Lainnya", "nominal": angka_saja}}
-        """
-        
+        # Tambahkan timeout singkat agar tidak nunggu kelamaan
         response = model.generate_content(prompt)
         res_text = response.text.strip()
         
-        # Membersihkan tag markdown jika AI menyertakannya
         if "```json" in res_text:
             res_text = res_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in res_text:
-            res_text = res_text.split("```")[1].strip()
-            
         return json.loads(res_text)
+
     except Exception as e:
-        st.error(f"Gagal memproses AI: {e}")
-        return None
+        # --- STEP 3: JIKA AI ERROR (429/404), PAKAI LOGIKA OFFLINE ---
+        st.warning("⚠️ Kuota AI Habis. Menggunakan pemrosesan offline...")
+        return fallback_parse(text)
 
 # --- APP UI ---
 st.set_page_config(page_title="AI Tracker Cloud", layout="wide")
