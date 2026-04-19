@@ -38,7 +38,12 @@ with col1:
     
     if st.button("Simpan"):
         if user_input:
-            model = genai.GenerativeModel('gemini-1.5-flash')
+            try:
+    # Kita coba gunakan 'gemini-1.5-flash' (versi stabil)
+                model = genai.GenerativeModel('gemini-1.5-flash')
+            except:
+    # Jika gagal (seperti error 404 tadi), kita pakai model 2.0 yang tadi terbukti ada di akunmu
+                model = genai.GenerativeModel('models/gemini-2.0-flash')
             prompt = f"Extract transaction in JSON: {user_input}. Format: {{\"item\":\"str\", \"kategori\":\"Makanan/Transportasi/Lainnya\", \"nominal\":int}}"
             
             try:
