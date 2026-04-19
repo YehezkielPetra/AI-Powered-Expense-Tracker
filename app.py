@@ -34,7 +34,8 @@ def process_with_ai(text):
                            if 'generateContent' in m.supported_generation_methods]
         
         # Urutan prioritas model
-        prioritas = ['models/gemini-2.0-flash', 'models/gemini-1.5-flash', 'models/gemini-pro']
+        # Pindahkan 1.5 ke depan karena kuotanya lebih banyak
+        prioritas = ['models/gemini-1.5-flash', 'models/gemini-2.0-flash', 'models/gemini-pro']
         
         target_model = None
         for p in prioritas:
