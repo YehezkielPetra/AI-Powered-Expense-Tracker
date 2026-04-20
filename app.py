@@ -54,55 +54,44 @@ def send_otp(recipient_email):
     except:
         return None
 
-# --- 3. LOGIKA PEMBERSIHAN INPUT (RB/JT/K) ---
+# --- 3. LOGIKA PEMBERSIHAN SATUAN (RB/JT/K) ---
 def clean_money_string(text_input):
-    # Ubah ke lowercase agar mudah diproses
     t = text_input.lower()
-    
-    # Tangani format desimal seperti 1.5jt atau 1,5jt -> 1500000
     def replace_suffix(match):
         val = float(match.group(1).replace(',', '.'))
         suffix = match.group(2)
         if suffix in ['jt', 'juta']: return str(int(val * 1000000))
         if suffix in ['rb', 'ribu', 'k']: return str(int(val * 1000))
         return match.group(0)
-
-    # Regex untuk mencari angka (termasuk titik/koma) diikuti satuan
     t = re.sub(r'(\d+[.,]?\d*)\s*(jt|juta|rb|ribu|k)', replace_suffix, t)
     return t
 
 # --- 4. LOGIKA AI ---
 def process_with_ai(text_input):
-    # Lakukan pembersihan satuan dulu (rb, jt, k)
     cleaned_text = clean_money_string(text_input)
-    
     data = {"item": text_input, "kategori": "Lainnya", "nominal": 0}
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
         prompt = f"Extract expense from: '{cleaned_text}'. Return ONLY JSON: {{\"item\": \"string\", \"kategori\": \"string\", \"nominal\": int}}."
         response = model.generate_content(prompt)
-        
         match = re.search(r'\{.*\}', response.text, re.DOTALL)
         if match:
             data = json.loads(match.group())
     except:
         pass
-
-    # Jika nominal masih 0, ambil angka murni dari cleaned_text sebagai fallback
+    
     if data.get('nominal', 0) == 0:
         found_numbers = re.findall(r'\d+', cleaned_text)
         if found_numbers:
             data['nominal'] = int(found_numbers[0])
 
-    # Pastikan nominal bersih dari karakter non-digit
     raw_nom = str(data.get('nominal', '0'))
     clean_nom = re.sub(r'[^\d]', '', raw_nom)
     data['nominal'] = int(clean_nom) if clean_nom else 0
-    
     return data
 
 # --- 5. MAIN INTERFACE ---
-st.set_page_config(page_title="AI Tracker Secure", layout="wide", page_icon="💰")
+st.set_page_config(page_title="AI Tracker Secure", layout="wide", page_icon="🛡️")
 init_db()
 
 if 'user' not in st.session_state: st.session_state.user = None
@@ -154,7 +143,6 @@ def main():
                     else: st.error("OTP Salah")
 
     else:
-        # --- DASHBOARD LOGGED IN ---
         user = st.session_state.user
         st.sidebar.title(f"👤 {user}")
         menu = st.sidebar.radio("Navigasi", ["🏠 Dashboard", "📜 History"])
@@ -174,24 +162,20 @@ def main():
                     if txt:
                         with st.spinner("Memproses..."):
                             data = process_with_ai(txt)
-                            
                             if data['nominal'] > 0:
                                 with engine.connect() as conn:
                                     conn.execute(text("""
                                         INSERT INTO expenses (username, tanggal, deskripsi, kategori, nominal) 
                                         VALUES (:u, :t, :d, :k, :n)
                                     """), {
-                                        "u": user, 
-                                        "t": datetime.now(), 
-                                        "d": data['item'], 
-                                        "k": data['kategori'], 
-                                        "n": float(data['nominal'])
+                                        "u": user, "t": datetime.now(), 
+                                        "d": data['item'], "k": data['kategori'], "n": float(data['nominal'])
                                     })
                                     conn.commit()
                                 st.success(f"Tersimpan: {data['item']} - Rp {data['nominal']:,.0f}")
                                 st.rerun()
                             else:
-                                st.error("Gagal mendeteksi harga. Harap masukkan angka yang jelas.")
+                                st.error("Gagal mendeteksi harga.")
 
             with col2:
                 st.subheader("Ringkasan Hari Ini")
@@ -212,8 +196,34 @@ def main():
             st.title("Riwayat Transaksi")
             with engine.connect() as conn:
                 df_all = pd.read_sql_query(text("SELECT * FROM expenses WHERE username = :u ORDER BY tanggal DESC"), conn, params={"u": user})
+            
             if not df_all.empty:
-                st.dataframe(df_all[['tanggal', 'deskripsi', 'kategori', 'nominal']], use_container_width=True)
+                df_all['tanggal'] = pd.to_datetime(df_all['tanggal'])
+                
+                for index, row in df_all.iterrows():
+                    with st.expander(f"📌 {row['tanggal'].strftime('%d %b %Y %H:%M')} | {row['deskripsi']} - Rp {row['nominal']:,.0f}"):
+                        c1, c2, c3 = st.columns([2, 1, 1])
+                        new_desc = c1.text_input("Deskripsi", value=row['deskripsi'], key=f"desc_{row['id']}")
+                        new_cat = c2.selectbox("Kategori", ["Makanan", "Transportasi", "Belanja", "Tagihan", "Lainnya"], 
+                                             index=["Makanan", "Transportasi", "Belanja", "Tagihan", "Lainnya"].index(row['kategori']) if row['kategori'] in ["Makanan", "Transportasi", "Belanja", "Tagihan", "Lainnya"] else 4,
+                                             key=f"cat_{row['id']}")
+                        new_nom = c3.number_input("Nominal", value=float(row['nominal']), key=f"nom_{row['id']}")
+                        
+                        btn_up, btn_del, _ = st.columns([1, 1, 2])
+                        if btn_up.button("Update", key=f"up_{row['id']}"):
+                            with engine.connect() as conn:
+                                conn.execute(text("UPDATE expenses SET deskripsi=:d, kategori=:k, nominal=:n WHERE id=:id"),
+                                             {"d": new_desc, "k": new_cat, "n": new_nom, "id": row['id']})
+                                conn.commit()
+                            st.success("Berhasil diupdate!")
+                            st.rerun()
+                        
+                        if btn_del.button("Hapus", key=f"del_{row['id']}"):
+                            with engine.connect() as conn:
+                                conn.execute(text("DELETE FROM expenses WHERE id=:id"), {"id": row['id']})
+                                conn.commit()
+                            st.warning("Data dihapus!")
+                            st.rerun()
             else:
                 st.warning("Data masih kosong.")
 
