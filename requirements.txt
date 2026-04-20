@@ -1,4 +1,7 @@
 streamlit
 pandas
 plotly
-google-generativeai
+google-generativeai>=0.8.3
+sqlalchemy
+psycopg2-binary
+dnspython

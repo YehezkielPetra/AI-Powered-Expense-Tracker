@@ -1,163 +1,221 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
+from sqlalchemy import create_engine, text
 import google.generativeai as genai
 from datetime import datetime, timedelta
 import plotly.express as px
 import json
 import re
+import hashlib
+import smtplib
+import random
+from email.message import EmailMessage
 
-# --- CONFIG & SECRETS ---
+# --- 1. CONFIG & SECRETS ---
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
+    DATABASE_URL = st.secrets["DATABASE_URL"]
+    EMAIL_SENDER = st.secrets["EMAIL_SENDER"]
+    EMAIL_PASSWORD = st.secrets["EMAIL_PASSWORD"]
+    
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    
     genai.configure(api_key=GOOGLE_API_KEY)
-except Exception:
-    st.error("⚠️ API Key belum dikonfigurasi di Streamlit Secrets.")
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+except Exception as e:
+    st.error(f"⚠️ Konfigurasi Error: {e}")
+    st.stop()
 
-# --- DATABASE SETUP ---
+# --- 2. DATABASE INITIALIZATION ---
 def init_db():
-    conn = sqlite3.connect('database_publik.db', check_same_thread=False)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS expenses 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                  tanggal TEXT, deskripsi TEXT, kategori TEXT, nominal REAL)''')
-    conn.commit()
-    return conn
+    with engine.connect() as conn:
+        conn.execute(text("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT, email TEXT);"))
+        conn.execute(text("""CREATE TABLE IF NOT EXISTS expenses (
+            id SERIAL PRIMARY KEY, username TEXT REFERENCES users(username),
+            tanggal TIMESTAMP DEFAULT CURRENT_TIMESTAMP, deskripsi TEXT, kategori TEXT, nominal DECIMAL(15,2));"""))
+        conn.commit()
 
-conn = init_db()
+def get_hash(password):
+    return hashlib.sha256(str.encode(password)).hexdigest()
 
-# --- LOGIKA KONVERSI NOMINAL PINTAR (rb, jt, k) ---
-def konversi_nominal(teks):
-    teks = teks.lower().replace(',', '.')
-    # Mencari pola angka + satuan (contoh: 50rb, 1.5jt, 10k)
-    match = re.search(r'(\d+\.?\d*)\s*(rb|jt|k|rban|jt-an)', teks)
-    
-    if match:
-        angka = float(match.group(1))
-        satuan = match.group(2)
-        if satuan in ['rb', 'k', 'rban']:
-            return angka * 1000
-        elif satuan in ['jt', 'jt-an']:
-            return angka * 1000000
-            
-    # Jika tidak ada satuan, ambil angka murni
-    nums = re.findall(r'\d+', teks.replace('.', '').replace(',', ''))
-    return float(nums[0]) if nums else 0
-
-# --- AI LOGIC DENGAN CADANGAN OFFLINE ---
-def process_with_ai(text):
-    def fallback_parse(t):
-        nom = konversi_nominal(t)
-        kat = "Lainnya"
-        t_low = t.lower()
-        if any(k in t_low for k in ["makan", "kopi", "bakso", "nasi", "sate", "ayam"]): kat = "Makanan"
-        elif any(k in t_low for k in ["bensin", "gojek", "grab", "parkir", "ojek", "fuel"]): kat = "Transportasi"
-        elif any(k in t_low for k in ["shopee", "tokped", "beli", "baju", "celana", "mall"]): kat = "Belanja"
-        elif any(k in t_low for k in ["listrik", "air", "wifi", "pulsa", "kuota", "kos"]): kat = "Tagihan"
-        
-        # Bersihkan deskripsi
-        desk = re.sub(r'\d+\.?\d*\s*(rb|jt|k|rban|jt-an)', '', t_low)
-        desk = re.sub(r'\d+', '', desk).replace('rp', '').strip().title()
-        return {"item": desk or "Transaksi", "kategori": kat, "nominal": nom}
-
+def send_otp(recipient_email):
+    otp = str(random.randint(100000, 999999))
+    msg = EmailMessage()
+    msg.set_content(f"Kode OTP pendaftaran AI Tracker Anda adalah: {otp}")
+    msg['Subject'] = 'Verifikasi Akun AI Tracker'
+    msg['From'] = EMAIL_SENDER
+    msg['To'] = recipient_email
     try:
-        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        prioritas = ['models/gemini-1.5-flash', 'models/gemini-2.0-flash']
-        target = next((p for p in prioritas if p in available_models), available_models[0])
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+            smtp.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            smtp.send_message(msg)
+        return otp
+    except:
+        return None
 
-        model = genai.GenerativeModel(target)
-        prompt = f"Extract transaction in JSON. 'rb'=1000, 'jt'=1000000. Text: {text}. Format: {{\"item\":\"str\", \"kategori\":\"str\", \"nominal\":int}}"
-        
+# --- 3. LOGIKA PEMBERSIHAN INPUT (RB/JT/K) ---
+def clean_money_string(text_input):
+    # Ubah ke lowercase agar mudah diproses
+    t = text_input.lower()
+    
+    # Tangani format desimal seperti 1.5jt atau 1,5jt -> 1500000
+    def replace_suffix(match):
+        val = float(match.group(1).replace(',', '.'))
+        suffix = match.group(2)
+        if suffix in ['jt', 'juta']: return str(int(val * 1000000))
+        if suffix in ['rb', 'ribu', 'k']: return str(int(val * 1000))
+        return match.group(0)
+
+    # Regex untuk mencari angka (termasuk titik/koma) diikuti satuan
+    t = re.sub(r'(\d+[.,]?\d*)\s*(jt|juta|rb|ribu|k)', replace_suffix, t)
+    return t
+
+# --- 4. LOGIKA AI ---
+def process_with_ai(text_input):
+    # Lakukan pembersihan satuan dulu (rb, jt, k)
+    cleaned_text = clean_money_string(text_input)
+    
+    data = {"item": text_input, "kategori": "Lainnya", "nominal": 0}
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        prompt = f"Extract expense from: '{cleaned_text}'. Return ONLY JSON: {{\"item\": \"string\", \"kategori\": \"string\", \"nominal\": int}}."
         response = model.generate_content(prompt)
-        res_text = response.text.strip()
         
-        if "```json" in res_text:
-            res_text = res_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in res_text:
-            res_text = res_text.split("```")[1].strip()
+        match = re.search(r'\{.*\}', response.text, re.DOTALL)
+        if match:
+            data = json.loads(match.group())
+    except:
+        pass
+
+    # Jika nominal masih 0, ambil angka murni dari cleaned_text sebagai fallback
+    if data.get('nominal', 0) == 0:
+        found_numbers = re.findall(r'\d+', cleaned_text)
+        if found_numbers:
+            data['nominal'] = int(found_numbers[0])
+
+    # Pastikan nominal bersih dari karakter non-digit
+    raw_nom = str(data.get('nominal', '0'))
+    clean_nom = re.sub(r'[^\d]', '', raw_nom)
+    data['nominal'] = int(clean_nom) if clean_nom else 0
+    
+    return data
+
+# --- 5. MAIN INTERFACE ---
+st.set_page_config(page_title="AI Tracker Secure", layout="wide", page_icon="💰")
+init_db()
+
+if 'user' not in st.session_state: st.session_state.user = None
+if 'otp_sent' not in st.session_state: st.session_state.otp_sent = False
+
+def main():
+    if st.session_state.user is None:
+        st.title("🛡️ Secure AI Tracker")
+        t_log, t_reg = st.tabs(["Login", "Register"])
+        
+        with t_log:
+            u = st.text_input("Username", key="l_u")
+            p = st.text_input("Password", type="password", key="l_p")
+            if st.button("Login", use_container_width=True):
+                with engine.connect() as conn:
+                    res = conn.execute(text("SELECT password FROM users WHERE username = :u"), {"u": u}).fetchone()
+                if res and res[0] == get_hash(p):
+                    st.session_state.user = u
+                    st.rerun()
+                else: st.error("Username atau Password salah")
+                    
+        with t_reg:
+            nu = st.text_input("Username Baru", key="r_u")
+            ne = st.text_input("Email", key="r_e")
+            np = st.text_input("Password Baru", type="password", key="r_p")
+            np2 = st.text_input("Konfirmasi Password", type="password", key="r_p2")
             
-        return json.loads(res_text)
-    except Exception as e:
-        if "429" in str(e) or "quota" in str(e).lower():
-            st.warning("⚠️ Kuota AI habis, menggunakan mode Offline Pintar.")
-        return fallback_parse(text)
+            if not st.session_state.otp_sent:
+                if st.button("Kirim Kode OTP", use_container_width=True):
+                    if nu and ne and np == np2 and len(np) >= 6:
+                        otp = send_otp(ne)
+                        if otp:
+                            st.session_state.otp_sent = True
+                            st.session_state.gen_otp = otp
+                            st.success(f"OTP dikirim ke {ne}!")
+                    else: st.error("Data tidak valid / Password minimal 6 karakter.")
+            else:
+                u_otp = st.text_input("Masukkan Kode OTP")
+                if st.button("Daftar Akun", use_container_width=True):
+                    if u_otp == st.session_state.gen_otp:
+                        try:
+                            with engine.connect() as conn:
+                                conn.execute(text("INSERT INTO users (username, password, email) VALUES (:u,:p,:e)"),
+                                             {"u": nu, "p": get_hash(np), "e": ne})
+                                conn.commit()
+                            st.success("Berhasil! Silakan Login.")
+                            st.session_state.otp_sent = False
+                        except: st.error("Username sudah ada.")
+                    else: st.error("OTP Salah")
 
-# --- UI STREAMLIT ---
-st.set_page_config(page_title="AI Tracker 2026", layout="wide", page_icon="💰")
-
-# Sidebar Navigation
-st.sidebar.title("Menu Utama")
-menu = st.sidebar.radio("Pindah Halaman:", ["🏠 Dashboard", "📜 History Detail"])
-
-if menu == "🏠 Dashboard":
-    st.title("💰 AI Expense Tracker")
-    st.markdown("Catat pengeluaranmu secepat kilat dengan bantuan AI.")
-    
-    col1, col2 = st.columns([1, 1])
-    
-    with col1:
-        st.subheader("Input Transaksi")
-        user_input = st.text_input("Contoh: Bensin 50rb atau Kopi 15k", placeholder="Ketik di sini...")
-        
-        if st.button("Simpan Transaksi"):
-            if user_input:
-                with st.spinner("AI sedang memproses..."):
-                    data = process_with_ai(user_input)
-                    if data and data['nominal'] > 0:
-                        c = conn.cursor()
-                        c.execute("INSERT INTO expenses (tanggal, deskripsi, kategori, nominal) VALUES (?,?,?,?)",
-                                  (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), data['item'], data['kategori'], data['nominal']))
-                        conn.commit()
-                        st.success(f"Tersimpan: {data['item']} - Rp {data['nominal']:,.0f}")
-                        st.rerun()
-                    else:
-                        st.error("Gagal mendeteksi nominal. Gunakan format: 'Bakso 20rb'")
-
-    with col2:
-        st.subheader("Ringkasan Hari Ini")
-        df_today = pd.read_sql_query("SELECT * FROM expenses WHERE date(tanggal) = date('now')", conn)
-        if not df_today.empty:
-            st.metric("Total Hari Ini", f"Rp {df_today['nominal'].sum():,.0f}")
-            fig = px.pie(df_today, values='nominal', names='kategori', hole=0.5, color_discrete_sequence=px.colors.qualitative.Pastel)
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Belum ada pengeluaran hari ini.")
-
-    st.divider()
-    st.subheader("Recent Transactions")
-    df_recent = pd.read_sql_query("SELECT * FROM expenses ORDER BY id DESC LIMIT 5", conn)
-    st.table(df_recent[['tanggal', 'deskripsi', 'kategori', 'nominal']])
-
-elif menu == "📜 History Detail":
-    st.title("📜 History Pengeluaran")
-    
-    df = pd.read_sql_query("SELECT * FROM expenses", conn)
-    if df.empty:
-        st.warning("Data masih kosong. Silakan input transaksi terlebih dahulu.")
     else:
-        df['tanggal'] = pd.to_datetime(df['tanggal'])
-        now = datetime.now()
+        # --- DASHBOARD LOGGED IN ---
+        user = st.session_state.user
+        st.sidebar.title(f"👤 {user}")
+        menu = st.sidebar.radio("Navigasi", ["🏠 Dashboard", "📜 History"])
         
-        tab1, tab2, tab3 = st.tabs(["📅 Hari Ini", "📅 Minggu Ini", "📅 Bulan Ini"])
-        
-        with tab1:
-            df_day = df[df['tanggal'].dt.date == now.date()]
-            st.metric("Total Hari Ini", f"Rp {df_day['nominal'].sum():,.0f}")
-            st.dataframe(df_day.sort_values(by='tanggal', ascending=False), use_container_width=True)
+        if st.sidebar.button("Logout", use_container_width=True):
+            st.session_state.user = None
+            st.rerun()
+
+        if menu == "🏠 Dashboard":
+            st.title(f"Selamat Datang, {user}!")
+            col1, col2 = st.columns(2)
             
-        with tab2:
-            start_week = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0)
-            df_week = df[df['tanggal'] >= start_week]
-            st.metric("Total Minggu Ini", f"Rp {df_week['nominal'].sum():,.0f}")
-            if not df_week.empty:
-                fig_bar = px.bar(df_week, x='tanggal', y='nominal', color='kategori', barmode='group')
-                st.plotly_chart(fig_bar, use_container_width=True)
-            st.dataframe(df_week.sort_values(by='tanggal', ascending=False), use_container_width=True)
-            
-        with tab3:
-            df_month = df[(df['tanggal'].dt.month == now.month) & (df['tanggal'].dt.year == now.year)]
-            st.metric("Total Bulan Ini", f"Rp {df_month['nominal'].sum():,.0f}")
-            if not df_month.empty:
-                fig_month = px.pie(df_month, values='nominal', names='kategori', hole=0.5)
-                st.plotly_chart(fig_month, use_container_width=True)
-            st.dataframe(df_month.sort_values(by='tanggal', ascending=False), use_container_width=True)
+            with col1:
+                st.subheader("Input Transaksi AI")
+                txt = st.text_input("Ketik pengeluaran (Contoh: Bakso 25rb)", key="input_exp")
+                if st.button("Simpan", use_container_width=True):
+                    if txt:
+                        with st.spinner("Memproses..."):
+                            data = process_with_ai(txt)
+                            
+                            if data['nominal'] > 0:
+                                with engine.connect() as conn:
+                                    conn.execute(text("""
+                                        INSERT INTO expenses (username, tanggal, deskripsi, kategori, nominal) 
+                                        VALUES (:u, :t, :d, :k, :n)
+                                    """), {
+                                        "u": user, 
+                                        "t": datetime.now(), 
+                                        "d": data['item'], 
+                                        "k": data['kategori'], 
+                                        "n": float(data['nominal'])
+                                    })
+                                    conn.commit()
+                                st.success(f"Tersimpan: {data['item']} - Rp {data['nominal']:,.0f}")
+                                st.rerun()
+                            else:
+                                st.error("Gagal mendeteksi harga. Harap masukkan angka yang jelas.")
+
+            with col2:
+                st.subheader("Ringkasan Hari Ini")
+                with engine.connect() as conn:
+                    df_today = pd.read_sql_query(text("""
+                        SELECT * FROM expenses 
+                        WHERE username = :u AND tanggal >= (CURRENT_TIMESTAMP - INTERVAL '24 hours')
+                    """), conn, params={"u": user})
+                
+                if not df_today.empty:
+                    st.metric("Total Pengeluaran", f"Rp {df_today['nominal'].sum():,.0f}")
+                    fig = px.pie(df_today, values='nominal', names='kategori', hole=0.5)
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("Belum ada transaksi dalam 24 jam terakhir.")
+
+        elif menu == "📜 History":
+            st.title("Riwayat Transaksi")
+            with engine.connect() as conn:
+                df_all = pd.read_sql_query(text("SELECT * FROM expenses WHERE username = :u ORDER BY tanggal DESC"), conn, params={"u": user})
+            if not df_all.empty:
+                st.dataframe(df_all[['tanggal', 'deskripsi', 'kategori', 'nominal']], use_container_width=True)
+            else:
+                st.warning("Data masih kosong.")
+
+if __name__ == "__main__":
+    main()
