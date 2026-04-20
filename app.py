@@ -101,7 +101,7 @@ def main():
     if st.session_state.user is None:
         st.title("🛡️ Secure AI Tracker")
         t_log, t_reg = st.tabs(["Login", "Register"])
-        
+        # ... (Logika Login & Register tetap sama)
         with t_log:
             u = st.text_input("Username", key="l_u")
             p = st.text_input("Password", type="password", key="l_p")
@@ -194,19 +194,39 @@ def main():
 
         elif menu == "📜 History":
             st.title("Riwayat Transaksi")
+            
+            # --- FILTER WAKTU ---
+            col_f1, col_f2 = st.columns([1, 2])
+            filter_type = col_f1.selectbox("Filter Periode", ["Semua", "Hari Ini", "Minggu Ini", "Bulan Ini"])
+            
+            query = "SELECT * FROM expenses WHERE username = :u"
+            params = {"u": user}
+            
+            if filter_type == "Hari Ini":
+                query += " AND tanggal >= CURRENT_DATE"
+            elif filter_type == "Minggu Ini":
+                query += " AND tanggal >= CURRENT_DATE - INTERVAL '7 days'"
+            elif filter_type == "Bulan Ini":
+                query += " AND tanggal >= CURRENT_DATE - INTERVAL '30 days'"
+            
+            query += " ORDER BY tanggal DESC"
+            
             with engine.connect() as conn:
-                df_all = pd.read_sql_query(text("SELECT * FROM expenses WHERE username = :u ORDER BY tanggal DESC"), conn, params={"u": user})
+                df_all = pd.read_sql_query(text(query), conn, params=params)
             
             if not df_all.empty:
+                st.info(f"Menampilkan {len(df_all)} transaksi ({filter_type})")
                 df_all['tanggal'] = pd.to_datetime(df_all['tanggal'])
                 
                 for index, row in df_all.iterrows():
                     with st.expander(f"📌 {row['tanggal'].strftime('%d %b %Y %H:%M')} | {row['deskripsi']} - Rp {row['nominal']:,.0f}"):
                         c1, c2, c3 = st.columns([2, 1, 1])
                         new_desc = c1.text_input("Deskripsi", value=row['deskripsi'], key=f"desc_{row['id']}")
-                        new_cat = c2.selectbox("Kategori", ["Makanan", "Transportasi", "Belanja", "Tagihan", "Lainnya"], 
-                                             index=["Makanan", "Transportasi", "Belanja", "Tagihan", "Lainnya"].index(row['kategori']) if row['kategori'] in ["Makanan", "Transportasi", "Belanja", "Tagihan", "Lainnya"] else 4,
-                                             key=f"cat_{row['id']}")
+                        
+                        kat_list = ["Makanan", "Transportasi", "Belanja", "Tagihan", "Lainnya"]
+                        cur_kat = row['kategori'] if row['kategori'] in kat_list else "Lainnya"
+                        new_cat = c2.selectbox("Kategori", kat_list, index=kat_list.index(cur_kat), key=f"cat_{row['id']}")
+                        
                         new_nom = c3.number_input("Nominal", value=float(row['nominal']), key=f"nom_{row['id']}")
                         
                         btn_up, btn_del, _ = st.columns([1, 1, 2])
@@ -225,7 +245,7 @@ def main():
                             st.warning("Data dihapus!")
                             st.rerun()
             else:
-                st.warning("Data masih kosong.")
+                st.warning(f"Data {filter_type} masih kosong.")
 
 if __name__ == "__main__":
     main()
